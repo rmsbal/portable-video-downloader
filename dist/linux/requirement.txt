@@ -1,0 +1,5 @@
+Please Install this to your machine:
+
+-PySide6
+-yt-dlp
+-pyinstaller
