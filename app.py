@@ -75,8 +75,8 @@ class DownloaderApp(QWidget):
         layout.addWidget(QLabel("Video URL:"))
         layout.addWidget(self.url_input)
 
-        self.filename_input = QLineEdit("%(title)s.%(ext)s")
-        self.filename_input.setPlaceholderText("Example: episode_3.%(ext)s or %(title)s.%(ext)s")
+        self.filename_input = QLineEdit("")
+        self.filename_input.setPlaceholderText("Optional basic filename, e.g. episode 3")
         layout.addWidget(QLabel("Filename:"))
         layout.addWidget(self.filename_input)
 
@@ -146,6 +146,15 @@ class DownloaderApp(QWidget):
             name = name.replace(ch, '_')
         return name
 
+    def sanitize_filename_base(self, name):
+        name = name.strip()
+        invalid = '<>:"/\|?*'
+        for ch in invalid:
+            name = name.replace(ch, '_')
+        name = '_'.join(name.split())
+        name = name.strip('._')
+        return name
+
     def get_yt_dlp_path(self):
         local_candidates = [
             os.path.join(APP_DIR, "yt-dlp.exe"),
@@ -202,7 +211,7 @@ class DownloaderApp(QWidget):
     def build_command(self):
         url = self.url_input.text().strip()
         path = self.path_input.text().strip()
-        filename = self.filename_input.text().strip() or "%(title)s.%(ext)s"
+        filename = self.filename_input.text().strip()
         subfolder = self.subfolder_input.text().strip()
         browser = self.browser_select.currentText()
 
@@ -219,6 +228,14 @@ class DownloaderApp(QWidget):
         yt_dlp = self.get_yt_dlp_path()
         if not yt_dlp:
             return None, None, "yt-dlp not found. Put yt-dlp beside the app or install it in PATH."
+
+        if filename:
+            filename = self.sanitize_filename_base(filename)
+            if not filename:
+                filename = "download"
+            filename = f"{filename}.%(ext)s"
+        else:
+            filename = "%(title)s.%(ext)s"
 
         output_template = os.path.join(path, filename)
         cmd = [yt_dlp]
