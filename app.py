@@ -40,6 +40,9 @@ class DownloadWorker(QThread):
                 line = line.strip()
                 self.log_signal.emit(line)
 
+                if "Resuming download" in line:
+                    self.log_signal.emit("🔄 Resuming previous download...")
+
                 if "%" in line and "download" in line.lower():
                     try:
                         percent = float(line.split('%')[0].split()[-1])
@@ -140,19 +143,19 @@ class DownloaderApp(QWidget):
         return url
 
     def sanitize_subfolder(self, name):
-        name = name.strip().replace('\\', '/').strip('/')
+        name = name.strip().replace("\\", "/").strip("/")
         invalid = '<>:"|?*'
         for ch in invalid:
-            name = name.replace(ch, '_')
+            name = name.replace(ch, "_")
         return name
 
     def sanitize_filename_base(self, name):
         name = name.strip()
-        invalid = '<>:"/\|?*'
+        invalid = '<>:"/\\|?*'
         for ch in invalid:
-            name = name.replace(ch, '_')
-        name = '_'.join(name.split())
-        name = name.strip('._')
+            name = name.replace(ch, "_")
+        name = "_".join(name.split())
+        name = name.strip("._")
         return name
 
     def get_yt_dlp_path(self):
@@ -165,8 +168,7 @@ class DownloaderApp(QWidget):
         for candidate in local_candidates:
             if os.path.exists(candidate):
                 return candidate
-        found = shutil.which("yt-dlp")
-        return found
+        return shutil.which("yt-dlp")
 
     def packaging_hint(self):
         if IS_WINDOWS:
@@ -219,6 +221,7 @@ class DownloaderApp(QWidget):
             return None, None, None
 
         url = self.normalize_url(url)
+
         if subfolder:
             subfolder = self.sanitize_subfolder(subfolder)
             path = os.path.join(path, subfolder)
@@ -247,8 +250,12 @@ class DownloaderApp(QWidget):
             cmd += ["--cookies-from-browser", browser]
 
         cmd += [
-            "--force-overwrites",
+            "--continue",
             "--restrict-filenames",
+            "--concurrent-fragments", "5",
+            "--buffer-size", "16K",
+            "--no-cache-dir",
+            "-f", "bv*+ba/b",
             "-o", output_template,
             url,
         ]
