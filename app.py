@@ -71,9 +71,12 @@ class DownloaderApp(QWidget):
         self.worker = None
         self.queue = deque()
         self.current_job = None
+        self.is_paused = False
+        self.paused_job = None
+        self.stop_requested = False
 
         self.setWindowTitle(f"🔥 {APP_NAME}")
-        self.setGeometry(200, 200, 880, 700)
+        self.setGeometry(200, 200, 500, 720)
 
         self.build_ui()
         self.run_startup_checks()
@@ -110,7 +113,8 @@ class DownloaderApp(QWidget):
         layout.addWidget(QLabel("Save to:"))
         layout.addLayout(path_layout)
 
-        btn_layout = QHBoxLayout()
+        queue_btn_layout = QHBoxLayout()
+
         self.add_btn = QPushButton("Add to Queue")
         self.add_btn.clicked.connect(self.add_to_queue)
 
@@ -120,10 +124,10 @@ class DownloaderApp(QWidget):
         self.clear_btn = QPushButton("Clear Queue")
         self.clear_btn.clicked.connect(self.clear_queue)
 
-        btn_layout.addWidget(self.add_btn)
-        btn_layout.addWidget(self.remove_btn)
-        btn_layout.addWidget(self.clear_btn)
-        layout.addLayout(btn_layout)
+        queue_btn_layout.addWidget(self.add_btn)
+        queue_btn_layout.addWidget(self.remove_btn)
+        queue_btn_layout.addWidget(self.clear_btn)
+        layout.addLayout(queue_btn_layout)
 
         self.queue_list = QListWidget()
         self.queue_list.itemDoubleClicked.connect(self.edit_item)
@@ -135,13 +139,18 @@ class DownloaderApp(QWidget):
         layout.addWidget(self.progress)
 
         action_layout = QHBoxLayout()
-        self.start_btn = QPushButton("Start Queue")
+
+        self.start_btn = QPushButton("Start Queue / Resume")
         self.start_btn.clicked.connect(self.start_queue)
 
-        self.stop_btn = QPushButton("Stop")
+        self.pause_btn = QPushButton("Pause Current")
+        self.pause_btn.clicked.connect(self.pause_download)
+
+        self.stop_btn = QPushButton("Stop Current")
         self.stop_btn.clicked.connect(self.stop_download)
 
         action_layout.addWidget(self.start_btn)
+        action_layout.addWidget(self.pause_btn)
         action_layout.addWidget(self.stop_btn)
         layout.addLayout(action_layout)
 
@@ -157,6 +166,11 @@ class DownloaderApp(QWidget):
             self.log.append(f"✅ yt-dlp found: {yt}")
         else:
             self.log.append("⚠️ yt-dlp not found in PATH or app folder.")
+
+        if IS_LINUX:
+            self.log.append("ℹ️ Linux detected.")
+        elif IS_WINDOWS:
+            self.log.append("ℹ️ Windows detected.")
 
     def default_download_path(self):
         if IS_WINDOWS:
@@ -209,12 +223,13 @@ class DownloaderApp(QWidget):
             name = "%(title)s.%(ext)s"
 
         output = os.path.join(path, name)
-
         cmd = [yt]
 
         browser = self.browser_select.currentText()
+        url = job["url"]
+
         if browser == "auto":
-            if "facebook.com" in job["url"]:
+            if "facebook.com" in url:
                 cmd += ["--cookies-from-browser", "chrome"]
         elif browser != "none":
             cmd += ["--cookies-from-browser", browser]
@@ -225,7 +240,7 @@ class DownloaderApp(QWidget):
             "--buffer-size", "16K",
             "-f", "bv*+ba/b",
             "-o", output,
-            job["url"],
+            url,
         ]
         return cmd
 
@@ -244,7 +259,8 @@ class DownloaderApp(QWidget):
         self.queue.append(job)
         self.refresh_queue()
 
-        self.log.append(f"📥 Added to queue: {url}")
+        display_name = job["filename"] if job["filename"] else "[auto]"
+        self.log.append(f"📥 Added to queue: {display_name} | {url}")
 
         self.url_input.clear()
         self.filename_input.clear()
@@ -264,8 +280,14 @@ class DownloaderApp(QWidget):
             self.queue = deque(q)
             self.refresh_queue()
             self.log.append(f"🗑️ Removed: {removed['url']}")
+        else:
+            self.log.append("⚠️ No queue item selected")
 
     def clear_queue(self):
+        if self.worker and self.worker.isRunning():
+            self.log.append("⚠️ Cannot clear queue while download is running")
+            return
+
         self.queue.clear()
         self.refresh_queue()
         self.log.append("🗑️ Queue cleared")
@@ -302,24 +324,30 @@ class DownloaderApp(QWidget):
         if self.worker and self.worker.isRunning():
             self.log.append("⚠️ A download is already running")
             return
-        self.process_next()
 
-    def process_next(self):
-        if not self.queue:
-            self.progress.setValue(0)
-            self.log.append("✅ All done")
+        if self.is_paused and self.paused_job:
+            self.log.append("▶️ Resuming paused download...")
+            self.current_job = self.paused_job
+            self.paused_job = None
+            self.is_paused = False
+            self.stop_requested = False
+            self.start_worker_for_current_job()
             return
 
-        self.current_job = self.queue.popleft()
-        self.refresh_queue()
+        self.process_next()
+
+    def start_worker_for_current_job(self):
+        if not self.current_job:
+            return
 
         cmd = self.build_command(self.current_job)
         if not cmd:
+            self.current_job = None
             self.process_next()
             return
 
-        self.log.append(f"▶ Starting: {self.current_job['url']}")
         self.progress.setValue(0)
+        self.log.append(f"▶ Starting: {self.current_job['url']}")
 
         self.worker = DownloadWorker(cmd)
         self.worker.log_signal.connect(self.log.append)
@@ -327,18 +355,59 @@ class DownloaderApp(QWidget):
         self.worker.finished_signal.connect(self.finished)
         self.worker.start()
 
+    def process_next(self):
+        if not self.queue:
+            self.current_job = None
+            self.progress.setValue(0)
+            self.log.append("✅ All done")
+            return
+
+        self.current_job = self.queue.popleft()
+        self.refresh_queue()
+        self.stop_requested = False
+        self.start_worker_for_current_job()
+
     def finished(self, code):
+        if self.is_paused:
+            self.log.append("⏸️ Download paused")
+            self.progress.setValue(0)
+            return
+
+        if self.stop_requested:
+            if self.current_job:
+                self.log.append(f"⛔ Stopped: {self.current_job['url']}")
+            self.current_job = None
+            self.stop_requested = False
+            self.progress.setValue(0)
+            return
+
         if code == 0:
             self.log.append("✅ Done")
         else:
-            self.log.append("⚠️ Failed or stopped")
+            self.log.append("⚠️ Failed")
 
+        self.current_job = None
         self.process_next()
+
+    def pause_download(self):
+        if self.worker and self.worker.isRunning() and self.current_job:
+            self.is_paused = True
+            self.stop_requested = False
+            self.paused_job = self.current_job
+            self.worker.stop()
+            self.log.append("⏸️ Pausing current download...")
+        else:
+            self.log.append("⚠️ No active download to pause")
 
     def stop_download(self):
         if self.worker and self.worker.isRunning():
+            self.is_paused = False
+            self.paused_job = None
+            self.stop_requested = True
             self.worker.stop()
             self.log.append("⛔ Stopping current download...")
+        else:
+            self.log.append("⚠️ No active download to stop")
 
 
 if __name__ == "__main__":
