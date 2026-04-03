@@ -78,3 +78,27 @@ source .venv/bin/activate
 
 pip install -r requirements.txt
 python app.py
+
+```
+
+## ❤️ Support This Project
+
+If you find this project useful, consider supporting its development:
+
+### 💸 Donate via PayPal
+👉 https://www.paypal.com/ncp/payment/UW7ASFGBX48WN
+
+Your support helps:
+- 🚀 Improve features
+- 🐛 Fix bugs faster
+- 📦 Maintain cross-platform builds
+
+---
+
+## ⭐ Support
+
+If you like this project:
+- Give it a ⭐ on GitHub  
+- Share it with others  
+- Contribute or suggest features  
+
