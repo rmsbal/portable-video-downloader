@@ -3,6 +3,7 @@ import os
 import shutil
 import subprocess
 import json
+import re
 from collections import deque
 from datetime import datetime
 
@@ -43,17 +44,21 @@ class DownloadWorker(QThread):
 
             for line in self.process.stdout:
                 line = line.strip()
+                if not line:
+                    continue
+
                 self.log_signal.emit(line)
 
                 if "Resuming download" in line:
                     self.log_signal.emit("🔄 Resuming previous download...")
 
                 if "%" in line and "download" in line.lower():
-                    try:
-                        percent = float(line.split("%")[0].split()[-1])
-                        self.progress_signal.emit(int(percent))
-                    except Exception:
-                        pass
+                    match = re.search(r"(\d+(?:\.\d+)?)%", line)
+                    if match:
+                        try:
+                            self.progress_signal.emit(int(float(match.group(1))))
+                        except Exception:
+                            pass
 
             code = self.process.wait()
             self.finished_signal.emit(code)
@@ -67,11 +72,83 @@ class DownloadWorker(QThread):
             self.process.terminate()
 
 
+class FormatWorker(QThread):
+    log_signal = Signal(str)
+    formats_signal = Signal(list)
+    finished_signal = Signal()
+
+    def __init__(self, cmd):
+        super().__init__()
+        self.cmd = cmd
+
+    def run(self):
+        resolutions = set()
+        audio_found = False
+
+        try:
+            process = subprocess.Popen(
+                self.cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                universal_newlines=True,
+            )
+
+            for line in process.stdout:
+                raw = line.rstrip()
+                if not raw:
+                    continue
+
+                self.log_signal.emit(raw)
+
+                lower = raw.lower()
+
+                if "audio only" in lower:
+                    audio_found = True
+
+                # detect 1920x1080
+                m = re.search(r"(\d{3,5})x(\d{3,5})", raw)
+                if m:
+                    try:
+                        h = int(m.group(2))
+                        if h >= 100:
+                            resolutions.add(h)
+                    except Exception:
+                        pass
+
+                # detect 1080p / 720p
+                for match in re.findall(r"\b(\d{3,5})p\b", lower):
+                    try:
+                        h = int(match)
+                        if h >= 100:
+                            resolutions.add(h)
+                    except Exception:
+                        pass
+
+            process.wait()
+
+            ordered = sorted(resolutions, reverse=True)
+            result = [f"{h}p" for h in ordered]
+
+            if audio_found:
+                result.append("Audio only")
+
+            self.formats_signal.emit(result)
+            self.finished_signal.emit()
+
+        except Exception as e:
+            self.log_signal.emit(f"❌ Error reading formats: {e}")
+            self.formats_signal.emit([])
+            self.finished_signal.emit()
+
+
 class DownloaderApp(QWidget):
     def __init__(self):
         super().__init__()
 
         self.worker = None
+        self.format_worker = None
         self.queue = deque()
         self.current_job = None
         self.is_paused = False
@@ -83,7 +160,7 @@ class DownloaderApp(QWidget):
         self.history_file = os.path.join(APP_DIR, "history.json")
 
         self.setWindowTitle(f"🔥 {APP_NAME}")
-        self.setGeometry(200, 200, 500, 780)
+        self.setGeometry(200, 150, 620, 860)
 
         self.build_ui()
         self.run_startup_checks()
@@ -92,10 +169,18 @@ class DownloaderApp(QWidget):
     def build_ui(self):
         layout = QVBoxLayout()
 
+        layout.addWidget(QLabel("Video URL:"))
+        url_row = QHBoxLayout()
+
         self.url_input = QLineEdit()
         self.url_input.setPlaceholderText("Paste video URL...")
-        layout.addWidget(QLabel("Video URL:"))
-        layout.addWidget(self.url_input)
+
+        self.check_res_btn = QPushButton("Check Resolutions")
+        self.check_res_btn.clicked.connect(self.check_resolutions)
+
+        url_row.addWidget(self.url_input)
+        url_row.addWidget(self.check_res_btn)
+        layout.addLayout(url_row)
 
         self.filename_input = QLineEdit()
         self.filename_input.setPlaceholderText("Optional filename (e.g. episode 1)")
@@ -106,6 +191,11 @@ class DownloaderApp(QWidget):
         self.subfolder_input.setPlaceholderText("Optional subfolder")
         layout.addWidget(QLabel("Subfolder:"))
         layout.addWidget(self.subfolder_input)
+
+        self.resolution_select = QComboBox()
+        self.resolution_select.addItems(["Best available"])
+        layout.addWidget(QLabel("Resolution:"))
+        layout.addWidget(self.resolution_select)
 
         self.browser_select = QComboBox()
         self.browser_select.addItems(["auto", "chrome", "firefox", "edge", "none"])
@@ -128,6 +218,7 @@ class DownloaderApp(QWidget):
         browse_btn.clicked.connect(self.browse_folder)
         path_layout.addWidget(self.path_input)
         path_layout.addWidget(browse_btn)
+
         layout.addWidget(QLabel("Save to:"))
         layout.addLayout(path_layout)
 
@@ -199,7 +290,7 @@ class DownloaderApp(QWidget):
 
         if IS_LINUX:
             self.log.append("ℹ️ Linux detected.")
-            self.log.append("ℹ️ Sleep prevention supported through systemd-inhibit if available.")
+            self.log.append("ℹ️ Sleep prevention supported via systemd-inhibit if available.")
         elif IS_WINDOWS:
             self.log.append("ℹ️ Windows detected.")
             self.log.append("ℹ️ Sleep prevention is not implemented in this version on Windows.")
@@ -236,6 +327,45 @@ class DownloaderApp(QWidget):
             return found
         return None
 
+    def build_browser_args(self, url):
+        browser = self.browser_select.currentText()
+        args = []
+
+        if browser == "auto":
+            if "facebook.com" in url or "fb.watch" in url:
+                args += ["--cookies-from-browser", "chrome"]
+        elif browser != "none":
+            args += ["--cookies-from-browser", browser]
+
+        return args
+
+    def build_format_check_command(self, url):
+        yt = self.get_yt_dlp()
+        if not yt:
+            self.log.append("❌ yt-dlp not found")
+            return None
+
+        cmd = [yt]
+        cmd += self.build_browser_args(url)
+        cmd += ["-F", url]
+        return cmd
+
+    def make_format_selector(self, resolution_text):
+        resolution_text = (resolution_text or "").strip()
+
+        if resolution_text == "Audio only":
+            return "bestaudio/best"
+
+        if resolution_text == "Best available" or not resolution_text:
+            return "bv*+ba/b"
+
+        match = re.match(r"(\d{3,5})p$", resolution_text)
+        if match:
+            h = int(match.group(1))
+            return f"bestvideo[height<={h}]+bestaudio/best[height<={h}]"
+
+        return "bv*+ba/b"
+
     def build_command(self, job):
         yt = self.get_yt_dlp()
         if not yt:
@@ -259,26 +389,80 @@ class DownloaderApp(QWidget):
             name = "%(title)s.%(ext)s"
 
         output = os.path.join(path, name)
-        cmd = [yt]
-
-        browser = self.browser_select.currentText()
         url = job["url"]
+        resolution = job.get("resolution", "Best available")
 
-        if browser == "auto":
-            if "facebook.com" in url:
-                cmd += ["--cookies-from-browser", "chrome"]
-        elif browser != "none":
-            cmd += ["--cookies-from-browser", browser]
+        cmd = [yt]
+        cmd += self.build_browser_args(url)
+
+        format_selector = self.make_format_selector(resolution)
 
         cmd += [
             "--continue",
             "--concurrent-fragments", "5",
             "--buffer-size", "16K",
-            "-f", "bv*+ba/b",
+            "-f", format_selector,
+        ]
+
+        if resolution == "Audio only":
+            cmd += ["-x", "--audio-format", "mp3"]
+
+        cmd += [
             "-o", output,
             url,
         ]
+
         return cmd
+
+    def check_resolutions(self):
+        url = self.url_input.text().strip()
+        if not url:
+            self.log.append("⚠️ Please enter a URL first")
+            return
+
+        if self.format_worker and self.format_worker.isRunning():
+            self.log.append("⚠️ Resolution check already running")
+            return
+
+        cmd = self.build_format_check_command(url)
+        if not cmd:
+            return
+
+        self.check_res_btn.setEnabled(False)
+        self.resolution_select.clear()
+        self.resolution_select.addItem("Checking...")
+
+        self.log.append("🔍 Checking available resolutions...")
+
+        self.format_worker = FormatWorker(cmd)
+        self.format_worker.log_signal.connect(self.log.append)
+        self.format_worker.formats_signal.connect(self.show_resolutions)
+        self.format_worker.finished_signal.connect(self.finish_resolution_check)
+        self.format_worker.start()
+
+    def show_resolutions(self, resolutions):
+        self.resolution_select.clear()
+
+        if not resolutions:
+            self.resolution_select.addItem("Best available")
+            QMessageBox.information(
+                self,
+                APP_NAME,
+                "No specific resolutions detected.\nUsing Best available."
+            )
+            return
+
+        self.resolution_select.addItem("Best available")
+        for item in resolutions:
+            if item != "Best available":
+                self.resolution_select.addItem(item)
+
+        self.log.append("✅ Available resolutions: " + ", ".join(
+            [self.resolution_select.itemText(i) for i in range(self.resolution_select.count())]
+        ))
+
+    def finish_resolution_check(self):
+        self.check_res_btn.setEnabled(True)
 
     def add_to_queue(self):
         url = self.url_input.text().strip()
@@ -286,10 +470,15 @@ class DownloaderApp(QWidget):
             self.log.append("⚠️ Please enter a URL")
             return
 
+        selected_resolution = self.resolution_select.currentText().strip()
+        if not selected_resolution:
+            selected_resolution = "Best available"
+
         job = {
             "url": url,
             "filename": self.filename_input.text().strip(),
             "subfolder": self.subfolder_input.text().strip(),
+            "resolution": selected_resolution,
             "retries_left": int(self.retry_select.currentText()),
             "status": "queued",
         }
@@ -299,20 +488,26 @@ class DownloaderApp(QWidget):
         self.refresh_queue()
 
         display_name = job["filename"] if job["filename"] else "[auto]"
-        self.log.append(f"📥 Added to queue: {display_name} | {url}")
+        self.log.append(
+            f"📥 Added to queue: {display_name} | {selected_resolution} | {url}"
+        )
 
         self.url_input.clear()
         self.filename_input.clear()
+        self.subfolder_input.clear()
+        self.resolution_select.clear()
+        self.resolution_select.addItem("Best available")
 
     def refresh_queue(self):
         self.queue_list.clear()
         for i, job in enumerate(self.queue, 1):
             name = job.get("filename") or "[auto]"
             folder = job.get("subfolder") or "[root]"
+            resolution = job.get("resolution") or "Best available"
             retries = job.get("retries_left", 0)
             status = job.get("status", "queued")
             self.queue_list.addItem(
-                f"{i}. {name} | {folder} | retries:{retries} | {status} | {job['url']}"
+                f"{i}. {name} | {folder} | {resolution} | retries:{retries} | {status} | {job['url']}"
             )
 
     def remove_selected(self):
@@ -359,8 +554,19 @@ class DownloaderApp(QWidget):
         if not ok:
             return
 
+        resolution_options = ["Best available", "2160p", "1440p", "1080p", "720p", "480p", "360p", "Audio only"]
+        current_res = job.get("resolution", "Best available")
+        current_index = resolution_options.index(current_res) if current_res in resolution_options else 0
+
+        new_res, ok = QInputDialog.getItem(
+            self, APP_NAME, "Edit resolution:", resolution_options, current_index, False
+        )
+        if not ok:
+            return
+
         job["filename"] = new_name.strip()
         job["subfolder"] = new_folder.strip()
+        job["resolution"] = new_res.strip() if new_res.strip() else "Best available"
 
         q[row] = job
         self.queue = deque(q)
@@ -401,7 +607,9 @@ class DownloaderApp(QWidget):
             return
 
         self.progress.setValue(0)
-        self.log.append(f"▶ Starting: {self.current_job['url']}")
+        self.log.append(
+            f"▶ Starting: {self.current_job['url']} | {self.current_job.get('resolution', 'Best available')}"
+        )
 
         self.worker = DownloadWorker(cmd)
         self.worker.log_signal.connect(self.log.append)
@@ -539,6 +747,7 @@ class DownloaderApp(QWidget):
                     continue
                 if status == "downloading":
                     job["status"] = "queued"
+                job.setdefault("resolution", "Best available")
                 cleaned.append(job)
 
             self.queue = deque(cleaned)
@@ -561,6 +770,7 @@ class DownloaderApp(QWidget):
                 "url": job.get("url", ""),
                 "filename": job.get("filename", ""),
                 "subfolder": job.get("subfolder", ""),
+                "resolution": job.get("resolution", "Best available"),
                 "result": result,
             })
 
@@ -587,8 +797,9 @@ class DownloaderApp(QWidget):
             lines = []
             for item in reversed(history[-30:]):
                 name = item.get("filename") or "[auto]"
+                res = item.get("resolution", "Best available")
                 lines.append(
-                    f"{item['time']} | {item['result']} | {name} | {item['url']}"
+                    f"{item['time']} | {item['result']} | {name} | {res} | {item['url']}"
                 )
 
             QMessageBox.information(self, APP_NAME, "\n".join(lines))
@@ -639,6 +850,7 @@ class DownloaderApp(QWidget):
                     continue
                 job.setdefault("filename", "")
                 job.setdefault("subfolder", "")
+                job.setdefault("resolution", "Best available")
                 job.setdefault("retries_left", int(self.retry_select.currentText()))
                 job.setdefault("status", "queued")
                 if job["status"] == "completed":
