@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Portable Video Downloader
+Exec=linux
+Icon=pvd-icon
+Categories=Utility;
+Terminal=false
